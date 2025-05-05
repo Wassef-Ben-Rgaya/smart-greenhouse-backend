@@ -486,63 +486,48 @@ class KPIController {
   }
 
   async calculateDailyAverages(todayStart) {
+    let dayEnd;
     try {
+      if (!(todayStart instanceof Date) || isNaN(todayStart.getTime())) {
+        throw new Error('Invalid todayStart: must be a valid Date object');
+      }
       console.log('Calculating daily averages for:', todayStart.toISOString());
-      const dayEnd = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
+      dayEnd = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
       console.log('Defined dayEnd:', dayEnd.toISOString());
-      
-      console.log('Fetching measurements for daily averages from', todayStart.toISOString(), 'to', dayEnd.toISOString());
-      console.log('Before Firebase query, dayEnd:', dayEnd.toISOString());
-      
+  
       const measurementsSnapshot = await this.measurementsRef
         .orderByKey()
         .startAt(todayStart.toISOString())
         .endAt(dayEnd.toISOString())
         .limitToLast(500)
         .once('value');
-      
-      console.log('After Firebase query, dayEnd:', dayEnd.toISOString());
-      
+  
       const measurements = [];
-      const invalidKeys = [];
-      const invalidData = [];
-      
       measurementsSnapshot.forEach(child => {
         const key = child.key;
         if (!this.isValidTimestamp(key)) {
-          invalidKeys.push(key);
           console.warn(`Skipping invalid measurement key: ${key}`);
           return true;
         }
         const data = this.convertMeasurementData(child.val());
         if (!this.isValidMeasurement({ id: key, ...data })) {
-          invalidData.push({ key, data });
           console.warn(`Skipping invalid measurement data for key: ${key}`, data);
           return true;
         }
         measurements.push({ id: key, ...data });
         return true;
       });
-
-      if (invalidKeys.length > 0 || invalidData.length > 0) {
-        console.error('Validation issues found in measurements:', {
-          invalidKeys,
-          invalidData
-        });
-      }
-      console.log('Retrieved measurements for daily averages:', measurements.length);
-
+  
       const validMeasurements = measurements.filter(m => this.isValidMeasurement(m));
-      if (validMeasurements.length !== measurements.length) {
-        console.warn(`Filtered out ${measurements.length - validMeasurements.length} invalid measurements for daily averages`);
-      }
-
+      console.log('Retrieved measurements for daily averages:', validMeasurements.length);
+  
       const avgTemperature = this.calculateAverage(validMeasurements, 'Température');
       const avgHumidity = this.calculateAverage(validMeasurements, 'Humidité');
       const avgLuminosity = this.calculateAverage(validMeasurements, 'Luminosité');
-      const soilHumidity = validMeasurements.length > 0 ? 
-        validMeasurements[validMeasurements.length - 1]['Humidité du sol'] : 0;
-
+      const soilHumidity = validMeasurements.length > 0
+        ? validMeasurements[validMeasurements.length - 1]['Humidité du sol']
+        : 0;
+  
       let wateringIntervals = [];
       for (let i = 0; i < validMeasurements.length - 1; i++) {
         if (validMeasurements[i].Pompe === false && validMeasurements[i + 1].Pompe === true) {
@@ -557,19 +542,17 @@ class KPIController {
       const avgWateringInterval = wateringIntervals.length > 0
         ? wateringIntervals.reduce((sum, val) => sum + val, 0) / wateringIntervals.length
         : 0;
-
-      console.log('Before manual commands query, dayEnd:', dayEnd.toISOString());
+  
       const manualCommandsSnapshot = await this.db.ref('serre_commandes_manuelles')
         .orderByChild('timestamp')
         .startAt(todayStart.toISOString())
         .endAt(dayEnd.toISOString())
         .limitToLast(100)
         .once('value');
-      console.log('After manual commands query, dayEnd:', dayEnd.toISOString());
-      
+  
       const manualCommands = manualCommandsSnapshot.val();
       const manualInterventionCount = manualCommands ? Object.keys(manualCommands).length : 0;
-
+  
       return {
         avgTemperature,
         avgHumidity,
@@ -585,7 +568,7 @@ class KPIController {
         stack: error.stack,
         query: {
           path: '/serre_mesures',
-          startAt: todayStart.toISOString(),
+          startAt: todayStart.toISOString ? todayStart.toISOString() : 'undefined',
           endAt: dayEnd ? dayEnd.toISOString() : 'undefined',
           limit: 500
         }
