@@ -2,8 +2,6 @@
 .env
 firebase-key.json
 firebase-realtime-key.json
-firebase.js
-firebaseRealtime.js
 
 # Dossiers communs à ignorer
 node_modules/
