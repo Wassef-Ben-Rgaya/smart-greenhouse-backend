@@ -1,3 +1,4 @@
+//MAJ 06/05/2025 01:35
 const admin = require('firebase-admin');
 const MeasurementModel = require('../models/measurement');
 const KPI = require('../models/kpi');
@@ -24,22 +25,37 @@ class KPIController {
     this.lastCacheTimestamp = null;
     this.bufferInterval = null;
     this.lastDailyReset = null;
+    this.isProcessingBuffer = false;
+    this.maxProcessedTimestamps = 10000;
 
     // WebSocket
     this.wss = new WebSocket.Server({ noServer: true });
     
-    // Configuration initiale
-    this.setupWebSocket();
-    this.initializeResetTimestamp();
-    this.setupMeasurementListener();
-    this.startBufferProcessing();
-
     // Liaison des méthodes
     this.getKPIs = this.getKPIs.bind(this);
     this.calculateKPIs = this.calculateKPIs.bind(this);
     this.handleUpgrade = this.handleUpgrade.bind(this);
     this.updateKPIs = this.updateKPIs.bind(this);
     this.forceManualReset = this.forceManualReset.bind(this);
+
+    // Configuration initiale
+    console.log('KPIController initialized, starting setup');
+    this.initialize(); // Appeler la méthode d'initialisation asynchrone
+  }
+
+  async initialize() {
+    try {
+      await this.initializeResetTimestamp();
+      await this.initializeLastMeasurementTime();
+      this.setupWebSocket();
+      this.setupMeasurementListener();
+      this.startBufferProcessing();
+      await this.archiveOldData(); // Archiver au démarrage
+      this.startArchiving();
+      console.log('KPIController setup complete');
+    } catch (error) {
+      console.error('Error during KPIController initialization:', error.message, error.stack);
+    }
   }
 
   /* Méthodes d'initialisation */
@@ -53,6 +69,17 @@ class KPIController {
       }
     } catch (error) {
       console.error('Error initializing reset timestamp:', error.message, error.stack);
+    }
+  }
+
+  async initializeLastMeasurementTime() {
+    try {
+      const snapshot = await this.db.ref('kpis/lastMeasurementTime').once('value');
+      this.lastMeasurementTime = snapshot.val() || '1970-01-01T00:00:00Z';
+      console.log('Initialized lastMeasurementTime:', this.lastMeasurementTime);
+    } catch (error) {
+      console.error('Error initializing lastMeasurementTime:', error.message, error.stack);
+      this.lastMeasurementTime = '1970-01-01T00:00:00Z'; // Valeur par défaut en cas d'erreur
     }
   }
 
@@ -71,7 +98,6 @@ class KPIController {
     this.wss.on('connection', (ws) => {
       console.log('New WebSocket connection for KPIs');
       
-      // Envoyer les KPIs actuels dès la connexion
       this.getCurrentKPIs()
         .then(kpis => {
           ws.send(JSON.stringify({
@@ -105,9 +131,11 @@ class KPIController {
 
   /* Méthodes de gestion des mesures */
   setupMeasurementListener() {
+    console.log('Setting up measurement listener with lastMeasurementTime:', this.lastMeasurementTime);
+    const startAfterValue = this.lastMeasurementTime || '1970-01-01T00:00:00Z';
     const query = this.measurementsRef
       .orderByKey()
-      .startAfter(this.lastMeasurementTime || '1970-01-01T00:00:00Z');
+      .startAfter(startAfterValue);
 
     query.on('child_added', (snapshot) => {
       try {
@@ -115,6 +143,16 @@ class KPIController {
           id: snapshot.key,
           ...this.convertMeasurementData(snapshot.val())
         };
+
+        // Ignorer les mesures plus vieilles que 24 heures
+        const measurementTime = new Date(measurement.id);
+        const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        if (measurementTime < oneDayAgo) {
+          console.log(`Ignoring old measurement: ${measurement.id}`);
+          this.lastMeasurementTime = measurement.id;
+          this.db.ref('kpis/lastMeasurementTime').set(measurement.id);
+          return;
+        }
 
         if (!this.isValidMeasurement(measurement)) {
           console.warn('Invalid measurement received:', measurement);
@@ -126,11 +164,16 @@ class KPIController {
           return;
         }
 
+        if (this.processedTimestamps.size > this.maxProcessedTimestamps) {
+          console.log('Clearing old processed timestamps');
+          this.processedTimestamps.clear();
+        }
+
         this.processedTimestamps.add(measurement.id);
         this.lastMeasurementTime = measurement.id;
+        this.db.ref('kpis/lastMeasurementTime').set(measurement.id);
         this.measurementBuffer.push(measurement);
-        console.log('Measurement added to buffer:', measurement.id);
-        
+        console.log(`Measurement added to buffer: ${measurement.id}, buffer size: ${this.measurementBuffer.length}`);
       } catch (error) {
         console.error('Error processing new measurement:', error.message, error.stack);
       }
@@ -152,13 +195,11 @@ class KPIController {
   isValidMeasurement(measurement) {
     if (!measurement || typeof measurement !== 'object') return false;
     
-    // Validation du timestamp
     if (!measurement.id || !this.isValidTimestamp(measurement.id)) {
       console.warn(`Invalid timestamp: ${measurement.id}`);
       return false;
     }
 
-    // Validation des champs numériques
     const numericFields = ['Température', 'Humidité', 'Humidité du sol', 'Luminosité'];
     for (const field of numericFields) {
       if (typeof measurement[field] !== 'number' || isNaN(measurement[field]) || !isFinite(measurement[field])) {
@@ -167,7 +208,6 @@ class KPIController {
       }
     }
 
-    // Validation des états booléens
     const booleanFields = ['Pompe', 'Ventilateur', 'Chauffage', 'Lampe'];
     for (const field of booleanFields) {
       if (!(typeof measurement[field] === 'boolean' || (typeof measurement[field] === 'number' && (measurement[field] === 0 || measurement[field] === 1)))) {
@@ -180,30 +220,45 @@ class KPIController {
   }
 
   isValidTimestamp(timestamp) {
-    const date = new Date(timestamp);
-    return !isNaN(date.getTime());
-  }
-
-  startBufferProcessing() {
-    if (!this.bufferInterval) {
-      this.bufferInterval = setInterval(() => this.processBuffer(), 5 * 60 * 1000); // Toutes les 5 minutes
+    try {
+      const date = new Date(timestamp);
+      if (isNaN(date.getTime())) return false;
+      const minValidDate = new Date('2020-01-01');
+      return date >= minValidDate && date <= new Date();
+    } catch (e) {
+      return false;
     }
   }
 
+  startBufferProcessing() {
+    if (this.bufferInterval) {
+      console.log('Clearing existing buffer processing interval');
+      clearInterval(this.bufferInterval);
+    }
+    this.bufferInterval = setInterval(() => this.processBuffer(), 5 * 60 * 1000);
+    console.log('Buffer processing interval started');
+  }
+
   async processBuffer() {
+    if (this.isProcessingBuffer) {
+      console.log('Buffer processing already in progress, skipping');
+      return;
+    }
     if (this.measurementBuffer.length < 2) {
       console.log('Not enough measurements in buffer to calculate KPIs:', this.measurementBuffer.length);
       return;
     }
 
-    console.log('Processing buffered measurements:', this.measurementBuffer.length);
-    const measurementsToProcess = [...this.measurementBuffer];
-    this.measurementBuffer = [];
-
+    console.log('Starting buffer processing, buffer size:', this.measurementBuffer.length);
+    this.isProcessingBuffer = true;
     try {
+      const measurementsToProcess = [...this.measurementBuffer];
       await this.calculateKPIsIncrementally(measurementsToProcess);
+      console.log('Buffer processing completed successfully');
     } catch (error) {
       console.error('Error processing measurement buffer:', error.message, error.stack);
+    } finally {
+      this.isProcessingBuffer = false;
     }
   }
 
@@ -211,11 +266,13 @@ class KPIController {
   async calculateKPIsIncrementally(measurements) {
     try {
       console.log('Starting calculateKPIsIncrementally with', measurements.length, 'measurements');
+
+      measurements.sort((a, b) => new Date(a.id) - new Date(b.id));
+
       const now = new Date();
       const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
       const maxDailySeconds = 24 * 60 * 60;
 
-      // Vérification de la réinitialisation mensuelle
       console.log('Fetching resetTimestamp');
       const resetSnapshot = await this.kpisRef.child('resetTimestamp').once('value');
       const lastReset = new Date(resetSnapshot.val() || now);
@@ -232,7 +289,6 @@ class KPIController {
         console.log('Cumuls reset for new month');
       }
 
-      // Vérification de la réinitialisation quotidienne
       const shouldResetDaily = !this.lastDailyReset || 
         this.lastDailyReset.getDate() !== now.getDate() || 
         this.lastDailyReset.getMonth() !== now.getMonth() || 
@@ -278,7 +334,6 @@ class KPIController {
         console.log('Daily totals and durations reset for new day');
       }
 
-      // Calcul des durées d'activation
       let durations = {
         pump: 0,
         fan: 0,
@@ -294,7 +349,10 @@ class KPIController {
         const duration = (new Date(next.id) - new Date(current.id)) / 1000;
 
         if (duration <= 0 || duration > maxDailySeconds) {
-          console.warn(`Invalid duration between measurements: ${duration} seconds, skipping`, current.id, next.id);
+          console.warn(`Invalid duration: ${duration} seconds, skipping`, {
+            currentTimestamp: current.id,
+            nextTimestamp: next.id
+          });
           continue;
         }
 
@@ -309,7 +367,6 @@ class KPIController {
         }
       }
 
-      // Mise à jour des totaux avec vérification des limites
       dailyTotals.dailyPumpSeconds = Math.min(dailyTotals.dailyPumpSeconds + durations.pump, maxDailySeconds);
       dailyTotals.dailyFanSeconds = Math.min(dailyTotals.dailyFanSeconds + durations.fan, maxDailySeconds);
       dailyTotals.dailyHeaterSeconds = Math.min(dailyTotals.dailyHeaterSeconds + durations.heater, maxDailySeconds);
@@ -317,17 +374,15 @@ class KPIController {
       dailyTotals.dailySunlightSeconds = Math.min(dailyTotals.dailySunlightSeconds + durations.sunlight, maxDailySeconds);
       dailyTotals.dailyLowLightSeconds = Math.min(dailyTotals.dailyLowLightSeconds + durations.lowLight, maxDailySeconds);
 
-      // S'assurer que la somme de dailySunlightSeconds et dailyLowLightSeconds ne dépasse pas 24 heures
       const totalLightSeconds = dailyTotals.dailySunlightSeconds + dailyTotals.dailyLowLightSeconds;
       if (totalLightSeconds > maxDailySeconds) {
-        console.warn(`Total light duration (${totalLightSeconds} seconds) exceeds 24 hours, scaling down proportionally`);
+        console.warn(`Total light duration (${totalLightSeconds} seconds) exceeds 24 hours, scaling down`);
         const scaleFactor = maxDailySeconds / totalLightSeconds;
         dailyTotals.dailySunlightSeconds *= scaleFactor;
         dailyTotals.dailyLowLightSeconds *= scaleFactor;
-        console.log(`Scaled sunlight to ${dailyTotals.dailySunlightSeconds} seconds and lowLight to ${dailyTotals.dailyLowLightSeconds} seconds`);
+        console.log(`Scaled sunlight to ${dailyTotals.dailySunlightSeconds} seconds`);
       }
 
-      // Calcul des totaux cumulés
       console.log('Fetching totals');
       const totalsSnapshot = await this.kpisRef.child('totals').once('value');
       let totals = totalsSnapshot.val() || {
@@ -346,7 +401,6 @@ class KPIController {
       await this.kpisRef.child('totals').set(totals);
       console.log('Updated totals:', totals);
 
-      // Calcul des moyennes
       const recentMeasurements = [...this.recentMeasurementsCache, ...measurements]
         .filter(m => new Date(m.id) >= todayStart);
       
@@ -364,20 +418,17 @@ class KPIController {
         recentMeasurements[recentMeasurements.length - 1]['Humidité du sol'] : 0;
       console.log('Calculated soilHumidity:', soilHumidity);
 
-      // Calcul de la consommation énergétique (kWh)
       const energyConsumption = (
         this.pumpPower * (totals.totalPumpSeconds / 3600) +
         this.fanPower * (totals.totalFanSeconds / 3600) +
         this.heaterPower * (totals.totalHeaterSeconds / 3600) +
         this.lampPower * (totals.totalLampSeconds / 3600)
       ) / 1000;
-      console.log('Calculated total energyConsumption:', energyConsumption);
+      console.log('Calculated energyConsumption:', energyConsumption);
 
-      // Calcul du volume d'eau (litres)
       const totalWaterVolume = (totals.totalPumpSeconds / 3600) * 60 * this.waterFlowRate;
       console.log('Calculated totalWaterVolume:', totalWaterVolume);
 
-      // Calcul de l'intervalle d'arrosage moyen
       let wateringIntervals = [];
       for (let i = 0; i < recentMeasurements.length - 1; i++) {
         if (recentMeasurements[i].Pompe === false && recentMeasurements[i + 1].Pompe === true) {
@@ -394,7 +445,6 @@ class KPIController {
         : 0;
       console.log('Calculated avgWateringInterval:', avgWateringInterval);
 
-      // Calcul du nombre d'interventions manuelles
       const dayEnd = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
       console.log('Fetching manual commands for period:', todayStart.toISOString(), 'to', dayEnd.toISOString());
       const manualCommandsSnapshot = await this.db.ref('serre_commandes_manuelles')
@@ -407,7 +457,6 @@ class KPIController {
       const manualInterventionCount = manualCommands ? Object.keys(manualCommands).length : 0;
       console.log('Calculated manualInterventionCount:', manualInterventionCount);
 
-      // Création du KPI
       const kpi = new KPI({
         avgTemperature,
         avgHumidity,
@@ -435,10 +484,13 @@ class KPIController {
       await this.kpisRef.child('daily').set(kpi.toJSON());
       console.log('Daily KPI saved');
       this.broadcastKPIs(kpi);
-
     } catch (error) {
       console.error('Error in calculateKPIsIncrementally:', error.message, 'Code:', error.code, error.stack);
       throw error;
+    } finally {
+      console.log('Clearing measurement buffer, size before:', this.measurementBuffer.length);
+      this.measurementBuffer = [];
+      console.log('Buffer cleared, size after:', this.measurementBuffer.length);
     }
   }
 
@@ -486,48 +538,66 @@ class KPIController {
   }
 
   async calculateDailyAverages(todayStart) {
-    let dayEnd;
+    const dayEnd = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
     try {
-      if (!(todayStart instanceof Date) || isNaN(todayStart.getTime())) {
-        throw new Error('Invalid todayStart: must be a valid Date object');
-      }
       console.log('Calculating daily averages for:', todayStart.toISOString());
-      dayEnd = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
+      
+      if (!dayEnd || isNaN(dayEnd.getTime())) {
+        throw new Error('Invalid dayEnd timestamp');
+      }
+      
       console.log('Defined dayEnd:', dayEnd.toISOString());
-  
+      console.log('Fetching measurements for daily averages from', todayStart.toISOString(), 'to', dayEnd.toISOString());
+      
       const measurementsSnapshot = await this.measurementsRef
         .orderByKey()
         .startAt(todayStart.toISOString())
         .endAt(dayEnd.toISOString())
         .limitToLast(500)
         .once('value');
-  
+      
+      console.log('Retrieved measurements snapshot for daily averages');
+      
       const measurements = [];
+      const invalidKeys = [];
+      const invalidData = [];
+      
       measurementsSnapshot.forEach(child => {
         const key = child.key;
         if (!this.isValidTimestamp(key)) {
+          invalidKeys.push(key);
           console.warn(`Skipping invalid measurement key: ${key}`);
           return true;
         }
         const data = this.convertMeasurementData(child.val());
         if (!this.isValidMeasurement({ id: key, ...data })) {
+          invalidData.push({ key, data });
           console.warn(`Skipping invalid measurement data for key: ${key}`, data);
           return true;
         }
         measurements.push({ id: key, ...data });
         return true;
       });
-  
+
+      if (invalidKeys.length > 0 || invalidData.length > 0) {
+        console.error('Validation issues found in measurements:', {
+          invalidKeys,
+          invalidData
+        });
+      }
+      console.log('Retrieved measurements for daily averages:', measurements.length);
+
       const validMeasurements = measurements.filter(m => this.isValidMeasurement(m));
-      console.log('Retrieved measurements for daily averages:', validMeasurements.length);
-  
+      if (validMeasurements.length !== measurements.length) {
+        console.warn(`Filtered out ${measurements.length - validMeasurements.length} invalid measurements`);
+      }
+
       const avgTemperature = this.calculateAverage(validMeasurements, 'Température');
       const avgHumidity = this.calculateAverage(validMeasurements, 'Humidité');
       const avgLuminosity = this.calculateAverage(validMeasurements, 'Luminosité');
-      const soilHumidity = validMeasurements.length > 0
-        ? validMeasurements[validMeasurements.length - 1]['Humidité du sol']
-        : 0;
-  
+      const soilHumidity = validMeasurements.length > 0 ? 
+        validMeasurements[validMeasurements.length - 1]['Humidité du sol'] : 0;
+
       let wateringIntervals = [];
       for (let i = 0; i < validMeasurements.length - 1; i++) {
         if (validMeasurements[i].Pompe === false && validMeasurements[i + 1].Pompe === true) {
@@ -542,17 +612,18 @@ class KPIController {
       const avgWateringInterval = wateringIntervals.length > 0
         ? wateringIntervals.reduce((sum, val) => sum + val, 0) / wateringIntervals.length
         : 0;
-  
+
+      console.log('Fetching manual commands for period:', todayStart.toISOString(), 'to', dayEnd.toISOString());
       const manualCommandsSnapshot = await this.db.ref('serre_commandes_manuelles')
         .orderByChild('timestamp')
         .startAt(todayStart.toISOString())
         .endAt(dayEnd.toISOString())
         .limitToLast(100)
         .once('value');
-  
+      
       const manualCommands = manualCommandsSnapshot.val();
       const manualInterventionCount = manualCommands ? Object.keys(manualCommands).length : 0;
-  
+
       return {
         avgTemperature,
         avgHumidity,
@@ -568,7 +639,7 @@ class KPIController {
         stack: error.stack,
         query: {
           path: '/serre_mesures',
-          startAt: todayStart.toISOString ? todayStart.toISOString() : 'undefined',
+          startAt: todayStart.toISOString(),
           endAt: dayEnd ? dayEnd.toISOString() : 'undefined',
           limit: 500
         }
@@ -702,7 +773,6 @@ class KPIController {
         console.log('Manual monthly reset completed');
       }
       else if (type === 'full') {
-        // Sauvegarder les KPIs actuels avant réinitialisation complète
         const kpiSnapshot = await this.kpisRef.child('daily').once('value');
         const kpi = kpiSnapshot.val() ? KPI.fromJSON(kpiSnapshot.val()) : new KPI({});
         
@@ -710,7 +780,6 @@ class KPIController {
           await this.saveDailyKPIs(kpi);
         }
         
-        // Réinitialiser tous les champs à 0
         await this.kpisRef.child('daily').set(new KPI({
           dailyTotals: {
             dailyPumpSeconds: 0,
@@ -746,7 +815,6 @@ class KPIController {
 
         await this.kpisRef.child('resetTimestamp').set(now.toISOString());
 
-        // Réinitialiser l'état interne
         this.lastDailyReset = now;
         this.lastMeasurementTime = null;
         this.lastCacheUpdate = null;
@@ -755,13 +823,12 @@ class KPIController {
         this.processedTimestamps.clear();
         this.measurementBuffer = [];
 
-        console.log('Full reset completed: all KPI fields set to 0');
+        console.log('Full reset completed');
       }
       else {
         throw new Error(`Invalid reset type: ${type}. Must be 'daily', 'monthly', or 'full'.`);
       }
 
-      // Diffuser les KPIs réinitialisés
       const resetKPI = await this.getCurrentKPIs();
       this.broadcastKPIs(resetKPI);
     } catch (error) {
@@ -772,7 +839,7 @@ class KPIController {
 
   async archiveOldData() {
     try {
-      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const sevenDaysAgo = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000).toISOString();
       console.log('Archiving data before:', sevenDaysAgo);
       const snapshot = await this.measurementsRef
         .orderByKey()
@@ -790,6 +857,11 @@ class KPIController {
     } catch (error) {
       console.error('Error archiving old data:', error.message, error.stack);
     }
+  }
+
+  startArchiving() {
+    setInterval(() => this.archiveOldData(), 24 * 60 * 60 * 1000);
+    console.log('Started periodic archiving');
   }
 }
 
