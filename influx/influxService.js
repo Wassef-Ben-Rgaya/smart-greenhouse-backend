@@ -1,10 +1,10 @@
 const Influx = require('influx');
 
 const influx = new Influx.InfluxDB({
-  host: '192.168.1.6',
-  database: 'serre_db',
-  username: 'wassef',
-  password: 'admin',
+  host: 'ip',
+  database: 'db',
+  username: 'username',
+  password: 'password',
 });
 
 const checkConnection = async () => {
