@@ -65,26 +65,7 @@ npm run dev       # Development
 npm start         # Production
 ```
 
-### Environment Variables (.env)
 
-```env
-PORT=3000
-JWT_SECRET=your_jwt_secret_here
-
-# Firebase
-FIREBASE_PROJECT_ID=your_project_id
-FIREBASE_PRIVATE_KEY=your_private_key
-FIREBASE_CLIENT_EMAIL=your_client_email
-FIREBASE_DATABASE_URL=your_database_url
-
-# InfluxDB
-INFLUX_URL=http://localhost:8086
-INFLUX_TOKEN=your_influx_token
-INFLUX_ORG=your_org
-INFLUX_BUCKET=serre
-```
-
----
 
 ## 🌐 API Endpoints
 
